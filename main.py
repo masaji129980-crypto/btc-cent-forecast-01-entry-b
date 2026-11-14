@@ -1,26 +1,19 @@
-#!/usr/bin/env python3
-"""btc-cent-forecast-01 entry: damped multi-horizon momentum forecaster.
+"""BTC 4-hour-ahead forecaster for make.fun btc-cent-forecast-01.
 
-Forecasts BTC's price 240 minutes after each checkpoint from the 4,320
-one-minute closes (72 hours) in the case file.
+Reads every ``*.in`` case found in the input directory (``$MAKEFUN_INPUT_DIR``
+or ``/input``) and writes one JSON guess per case into the output directory
+(``$MAKEFUN_OUTPUT_DIR`` or ``/output``).
 
-Method: take log-returns over 1h / 6h / 24h lookbacks, scale each linearly
-to the 240-minute horizon, and combine them with weights that favour the
-recent past (0.80 / 0.15 / 0.05). The combined drift is damped with a
-shrinkage factor of 0.4 -- at a 4-hour horizon, short-horizon noise dominates
-and the raw extrapolated drift overstates the move -- and the predicted
-log-move is clamped to one realized 240-minute standard deviation (from
-1-minute log-returns over the last 24 hours), so a wild recent swing cannot
-produce an extreme guess. The forecast is the checkpoint close times
-exp(damped, clamped move), rounded to the price grid's 5 decimals and kept
-inside the scorer's bounds.
+Method: damped multi-horizon momentum on log-returns.  Log-returns over the
+last hour, the last six hours and the last day are each stretched linearly to
+the 240-minute horizon, blended with weights that favour the recent past, and
+then shrunk by a damping factor.  The resulting log-move is clamped to one
+realised 240-minute volatility (the standard deviation of 1-minute log-returns
+over the last day, scaled up to 240 minutes) and additionally capped at 5%,
+so a wild print can never throw the guess far from the checkpoint close.
+If the input is unusable, the checkpoint close itself is the guess.
 
-Settings were checked honestly against the kit's practice cases (5 of 6 have
-a knowable target: each target equals the next case's checkpoint close).
-The practice is no guide to the final, so the settings stay conservative:
-heavy damping and a 1-sigma clamp.
-
-Python 3.13 standard library only, deterministic, no network, no randomness.
+Standard library only, no network, no randomness, fully deterministic.
 """
 
 import json
@@ -28,93 +21,188 @@ import math
 import os
 from pathlib import Path
 
-INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR") or "/input"
-OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
+# --- tuning knobs -----------------------------------------------------------
+# How far back each momentum window reaches, in minutes.
+NEAR_MINUTES = 60
+MID_MINUTES = 360
+FAR_MINUTES = 1440
 
-MIN_PRICE = 0.00001
-MAX_PRICE = 9_999_999.99999
+# Blend weights for the three windows; the recent past dominates.
+NEAR_WEIGHT = 0.80
+MID_WEIGHT = 0.15
+FAR_WEIGHT = 0.05
 
-# Lookbacks in minutes, with the weight each horizon's scaled drift gets.
-HORIZONS = ((60, 0.80), (360, 0.15), (1440, 0.05))
-SHRINK = 0.4           # damping applied to the combined extrapolated drift
-CLAMP_SIGMAS = 1.0     # max |predicted log-move| in units of realized 240-min sigma
-MAX_MOVE = 0.05        # hard cap on |predicted log-move| (~5% in 4h), a second
-                       # safety net for wild markets where realized sigma is huge
-VOL_WINDOW = 1440      # minutes of 1-minute returns used for realized volatility
+# How much of the blended drift we actually trust.
+DAMPING = 0.40
+
+# Second safety net on the predicted log-move, besides the volatility clamp.
+MOVE_LIMIT = 0.05
+
+# How many minutes of 1-minute returns feed the volatility estimate.
+VOL_MINUTES = 1440
+
+# Target horizon of the competition, in minutes.
+TARGET_MINUTES = 240
+
+# Bounds the scorer accepts for a price guess.
+MIN_PRICE = 0.0
+MAX_PRICE = 10_000_000.0
 
 
-def price5(x):
-    """x kept on the grid's 5 decimals and inside the scorer's (0, 10,000,000)."""
-    return round(min(MAX_PRICE, max(MIN_PRICE, x)) * 1e5) / 1e5
+def _valid_price(value):
+    """Return the value as a finite positive float, or None."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number <= 0.0:
+        return None
+    return number
 
 
-def log_return(prices, minutes):
-    """Log-return of the last price vs the price `minutes` ago (or the first)."""
-    if len(prices) < 2:
+def _clean_series(raw):
+    """Keep only finite positive closes, in order; drop anything else."""
+    series = []
+    for value in raw or []:
+        price = _valid_price(value)
+        if price is not None:
+            series.append(price)
+    return series
+
+
+def _log_change(series, span):
+    """Log-return over the last ``span`` minutes of ``series``.
+
+    Returns None when the series does not hold the full window, so a
+    short series never lets a window silently stand in for a longer one
+    (a 99-minute stretch must not be scaled as if it were a whole day).
+    """
+    if len(series) < span + 1:
+        return None
+    earlier = series[-span - 1]
+    later = series[-1]
+    return math.log(later / earlier)
+
+
+def _minute_returns(series, count):
+    """1-minute log-returns over the last ``count`` minutes of ``series``."""
+    tail = series[-(count + 1):]
+    out = []
+    for prev, cur in zip(tail, tail[1:]):
+        out.append(math.log(cur / prev))
+    return out
+
+
+def _spread(values):
+    """Population standard deviation of a list of numbers (0 if degenerate)."""
+    n = len(values)
+    if n < 2:
         return 0.0
-    back = prices[0] if minutes >= len(prices) else prices[-1 - minutes]
-    if back <= 0 or prices[-1] <= 0:
+    mean = sum(values) / n
+    variance = sum((v - mean) ** 2 for v in values) / n
+    return math.sqrt(variance)
+
+
+def _volatility_240(series):
+    """Realised volatility scaled to the 240-minute horizon.
+
+    Standard deviation of 1-minute log-returns over the last day, scaled by
+    sqrt(240) under the usual random-walk scaling.
+    """
+    returns = _minute_returns(series, VOL_MINUTES)
+    if not returns:
         return 0.0
-    return math.log(prices[-1] / back)
+    return _spread(returns) * math.sqrt(TARGET_MINUTES)
 
 
-def realized_sigma_240(prices):
-    """Std-dev of 1-minute log-returns over the last VOL_WINDOW minutes,
-    scaled to a 240-minute horizon. Falls back to a small floor."""
-    n = min(VOL_WINDOW, len(prices) - 1)
-    if n < 10:
-        return 0.001
-    rets = []
-    for i in range(len(prices) - n, len(prices)):
-        a, b = prices[i - 1], prices[i]
-        if a > 0 and b > 0:
-            rets.append(math.log(b / a))
-    if len(rets) < 10:
-        return 0.001
-    mean = sum(rets) / len(rets)
-    var = sum((r - mean) ** 2 for r in rets) / len(rets)
-    return max(math.sqrt(var * 240), 1e-6)
+def _projected_log_move(series):
+    """Damped, clamped log-move expected over the next 240 minutes."""
+    windows = (
+        (NEAR_MINUTES, NEAR_WEIGHT),
+        (MID_MINUTES, MID_WEIGHT),
+        (FAR_MINUTES, FAR_WEIGHT),
+    )
+    blended = 0.0
+    weight_used = 0.0
+    for span, weight in windows:
+        change = _log_change(series, span)
+        if change is None:
+            continue
+        # Stretch the window's log-return linearly to the target horizon.
+        blended += weight * change * (TARGET_MINUTES / span)
+        weight_used += weight
+    if weight_used == 0.0:
+        return 0.0
+    blended /= weight_used
+
+    move = blended * DAMPING
+
+    # Clamp to one realised 240-minute volatility, then to the hard cap.
+    sigma = _volatility_240(series)
+    if sigma > 0.0:
+        move = max(-sigma, min(sigma, move))
+    move = max(-MOVE_LIMIT, min(MOVE_LIMIT, move))
+    return move
 
 
-def forecast(prices):
-    """One forecast: the checkpoint close moved by the damped, clamped drift."""
-    # Robustness: a non-positive or non-finite close anywhere breaks log
-    # math, so fall back to persistence on the last valid close.
-    valid = [p for p in prices if isinstance(p, (int, float)) and math.isfinite(p) and p > 0]
-    if len(valid) != len(prices):
-        if not valid:
-            raise ValueError("no valid prices")
-        return price5(valid[-1])
-    last = prices[-1]
-    drift = 0.0
-    for minutes, weight in HORIZONS:
-        # Scale this horizon's log-return linearly to the 240-minute horizon.
-        drift += weight * log_return(prices, minutes) * (240.0 / minutes)
-    move = SHRINK * drift
-    cap = CLAMP_SIGMAS * realized_sigma_240(prices)
-    move = max(-cap, min(cap, move))
-    move = max(-MAX_MOVE, min(MAX_MOVE, move))
-    return price5(last * math.exp(move))
+def guess(series):
+    """Forecast price 240 minutes after the last close in ``series``."""
+    if not series:
+        return 1.0
+    anchor = series[-1]
+    move = _projected_log_move(series)
+    if move == 0.0 or not math.isfinite(move):
+        return round(anchor, 5)
+    estimate = anchor * math.exp(move)
+    estimate = round(estimate, 5)
+    if not math.isfinite(estimate) or estimate <= MIN_PRICE:
+        return round(anchor, 5)
+    if estimate >= MAX_PRICE:
+        return round(min(anchor, MAX_PRICE - 0.00001), 5)
+    return estimate
+
+
+def _case_files(input_dir):
+    return sorted(Path(input_dir).glob("*.in"))
+
+
+def _read_case(path):
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _extract_prices(case):
+    """Pull the single market's close list out of a case document."""
+    markets = case.get("markets") or []
+    if not markets:
+        return []
+    return _clean_series(markets[0].get("prices") or [])
+
+
+def _write_guess(output_dir, case_id, price):
+    payload = {"forecasts": [{"case": case_id, "price": price}]}
+    out_path = Path(output_dir) / (case_id + ".out")
+    with open(out_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle)
 
 
 def main():
-    in_dir = Path(INPUT_DIR)
-    out_dir = Path(OUTPUT_DIR)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    for name in sorted(p.name for p in in_dir.glob("*.in")):
-        case_id = name[: -len(".in")]
-        with open(in_dir / name, "r", encoding="utf-8") as fh:
-            case = json.load(fh)
-        markets = case["markets"]
-        if len(markets) != 1:
-            raise ValueError(f"{name} does not hold exactly one market")
-        prices = markets[0]["prices"]
-        if not prices:
-            raise ValueError(f"{name} holds no prices")
-        guess = forecast([float(p) for p in prices])
-        out = {"forecasts": [{"case": case_id, "price": guess}]}
-        with open(out_dir / f"{case_id}.out", "w", encoding="utf-8") as fh:
-            fh.write(json.dumps(out) + "\n")
+    input_dir = os.environ.get("MAKEFUN_INPUT_DIR") or "/input"
+    output_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    for case_path in _case_files(input_dir):
+        try:
+            case = _read_case(case_path)
+        except (OSError, ValueError):
+            # Last resort: the file cannot be parsed, so no checkpoint close
+            # is known. Still emit a shape-valid guess (price 1.0) so the
+            # case stays valid rather than missing outright.
+            _write_guess(output_dir, case_path.stem, 1.0)
+            continue
+        case_id = case.get("case") or case_path.stem
+        series = _extract_prices(case)
+        _write_guess(output_dir, case_id, guess(series))
 
 
 if __name__ == "__main__":
